@@ -7,7 +7,23 @@ import os
 import sqlite3
 import sys
 import requests
+import time
 
+_get = requests.get
+
+
+def get_lento(*args, **kwargs):
+    for _ in range(4):
+        time.sleep(7)
+        r = _get(*args, **kwargs)
+        err = r.json().get("errors")
+        if not (isinstance(err, dict) and "rateLimit" in err):
+            break
+        time.sleep(20)
+    return r
+
+
+requests.get = get_lento
 DB = "datoybarro.db"
 API = "https://v3.football.api-sports.io"
 LIGAS = [140, 39, 135]
