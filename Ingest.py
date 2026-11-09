@@ -34,9 +34,10 @@ CREATE TABLE IF NOT EXISTS stats(
 CREATE TABLE IF NOT EXISTS indice(
   jugador_id INTEGER, temporada INTEGER, score REAL,
   PRIMARY KEY(jugador_id, temporada));
-CREATE TABLE IF NOT EXISTS progreso(
-  liga INTEGER, temporada INTEGER, pagina INTEGER,
-  total INTEGER, PRIMARY KEY(liga, temporada));
+CREATE TABLE IF NOT EXISTS equipos(
+  liga INTEGER, temporada INTEGER, equipo_id INTEGER,
+  nombre TEXT, hecho INTEGER,
+  PRIMARY KEY(liga, temporada, equipo_id));
 """
 
 
@@ -60,18 +61,19 @@ def insertar(c, tabla, fila):
     c.execute(sql % (tabla, nombres, marcas), fila)
 
 
-def guardar(c, item, liga):
+def guardar(c, item):
     p = item["player"]
     s = None
     for x in item["statistics"]:
-        if x["league"]["id"] == liga:
+        if x["league"]["id"] in LIGAS:
             s = x
+            break
     if s is None or not p.get("age"):
-        return
+        return 0
     if p["age"] > MAX_EDAD:
-        return
+        return 0
     if v(s, "games", "minutes") < MIN_MINUTOS:
-        return
+        return 0
     nac = (p.get("birth") or {}).get("date")
     insertar(c, "jugadores", {
         "id": p["id"], "nombre": p["name"], "edad": p["age"],
@@ -99,39 +101,74 @@ def guardar(c, item, liga):
         "regates_ok": v(s, "dribbles", "success"),
         "faltas_recibidas": v(s, "fouls", "drawn"),
         "faltas_cometidas": v(s, "fouls", "committed")})
+    return 1
+
+
+def pedir(ruta, par, est):
+    h = {"x-apisports-key": os.environ["API_KEY"]}
+    r = requests.get(API + ruta, headers=h, params=par, timeout=30)
+    cab = r.headers.get("x-ratelimit-requests-remaining", 100)
+    est["quedan"] = int(cab) - 1
+    d = r.json()
+    if d.get("errors"):
+        print("Error de la API:", d["errors"])
+        return None
+    return d
+
+
+def cargar_equipos(c, liga, est):
+    q = "SELECT COUNT(*) FROM equipos WHERE liga=? AND temporada=?"
+    if c.execute(q, (liga, SEASON)).fetchone()[0]:
+        return True
+    d = pedir("/teams", {"league": liga, "season": SEASON}, est)
+    if d is None:
+        return False
+    for t in d["response"]:
+        fila = (liga, SEASON, t["team"]["id"], t["team"]["name"], 0)
+        c.execute("INSERT OR IGNORE INTO equipos VALUES(?,?,?,?,?)", fila)
+    c.commit()
+    return True
+
+
+def cargar_equipo(c, equipo_id, est):
+    pagina = 1
+    total = 1
+    n = 0
+    while pagina <= min(total, 3):
+        par = {"team": equipo_id, "season": SEASON, "page": pagina}
+        d = pedir("/players", par, est)
+        if d is None:
+            return None
+        total = d["paging"]["total"]
+        for item in d["response"]:
+            n += guardar(c, item)
+        pagina += 1
+    return n
 
 
 def load():
-    h = {"x-apisports-key": os.environ["API_KEY"]}
     c = db()
-    q = "SELECT pagina,total FROM progreso WHERE liga=? AND temporada=?"
+    est = {"quedan": 100}
+    q = ("SELECT equipo_id, nombre FROM equipos "
+         "WHERE liga=? AND temporada=? AND hecho=0")
     for liga in LIGAS:
-        row = c.execute(q, (liga, SEASON)).fetchone()
-        pagina, total = row if row else (1, 1)
-        while pagina <= total:
-            par = {"league": liga, "season": SEASON, "page": pagina}
-            r = requests.get(API + "/players", headers=h,
-                             params=par, timeout=30)
-            cab = r.headers.get("x-ratelimit-requests-remaining", 100)
-            quedan = int(cab) - 1
-            d = r.json()
-            if d.get("errors"):
-                print("Error de la API:", d["errors"])
-                c.commit()
-                return
-            total = d["paging"]["total"]
-            for item in d["response"]:
-                guardar(c, item, liga)
-            pagina += 1
-            c.execute("INSERT OR REPLACE INTO progreso VALUES(?,?,?,?)",
-                      (liga, SEASON, pagina, total))
-            c.commit()
-            print("Liga", liga, "pagina", pagina - 1, "de", total,
-                  "- quedan", quedan, "peticiones hoy")
-            if quedan <= RESERVA:
+        if not cargar_equipos(c, liga, est):
+            return
+        for eid, nombre in c.execute(q, (liga, SEASON)).fetchall():
+            if est["quedan"] <= RESERVA + 3:
                 print("Cuota casi agotada: sigue manana.")
                 return
-        c.execute("UPDATE progreso SET pagina=1 WHERE liga=?", (liga,))
+            n = cargar_equipo(c, eid, est)
+            if n is None:
+                c.commit()
+                return
+            c.execute("UPDATE equipos SET hecho=1 WHERE liga=? "
+                      "AND temporada=? AND equipo_id=?",
+                      (liga, SEASON, eid))
+            c.commit()
+            print(nombre, ":", n, "jugadores guardados. Quedan",
+                  est["quedan"], "peticiones hoy")
+    c.execute("UPDATE equipos SET hecho=0")
     c.commit()
 
 
